@@ -3,8 +3,14 @@ import {
   Home, Users, Calendar as CalendarIcon, Wallet, Plus, X, Phone, MessageCircle,
   Check, XCircle, Clock, ChevronLeft, ChevronRight, Bell, MapPin, Edit2, Trash2,
   RotateCcw, CheckCircle2, AlertTriangle, TrendingUp, Ticket, ArrowUpRight,
-  ArrowDownRight, CalendarPlus, BellRing, Sparkles
+  ArrowDownRight, CalendarPlus, BellRing, Sparkles, LogOut, Cloud, CloudOff, Mail, Lock
 } from 'lucide-react';
+import {
+  onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  signOut,
+} from 'firebase/auth';
+import { doc, onSnapshot, setDoc } from 'firebase/firestore';
+import { auth, db } from './firebase';
 
 /* ---------------------------------- constants ---------------------------------- */
 
@@ -251,28 +257,82 @@ export default function App() {
   );
   const notifiedRef = useRef(new Set());
 
-  /* ---- load once ---- */
+  /* ---- auth state ---- */
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [syncState, setSyncState] = useState('idle'); // idle | synced | offline
+  const remoteUpdateRef = useRef(false);
+
   useEffect(() => {
-    (async () => {
-      const data = await loadData();
-      if (data) {
-        setTeachers(data.teachers || []);
-        setOverrides(data.overrides || {});
-        setOneOffs(data.oneOffs || []);
-        setPayments(data.payments || []);
-      }
-      setLoaded(true);
-    })();
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthChecked(true);
+    });
+    return unsub;
   }, []);
 
-  /* ---- save on change (debounced) ---- */
+  /* ---- instant local cache while Firestore connects, so the UI isn't empty ---- */
   useEffect(() => {
-    if (!loaded) return;
-    const t = setTimeout(() => {
+    if (!user) return;
+    (async () => {
+      const cached = await loadData();
+      if (cached) {
+        setTeachers(cached.teachers || []);
+        setOverrides(cached.overrides || {});
+        setOneOffs(cached.oneOffs || []);
+        setPayments(cached.payments || []);
+      }
+    })();
+  }, [user]);
+
+  /* ---- live Firestore subscription — this is what keeps phones in sync ---- */
+  useEffect(() => {
+    if (!user) {
+      setLoaded(false);
+      return;
+    }
+    const ref = doc(db, 'households', user.uid);
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        const data = snap.exists() ? snap.data() : null;
+        remoteUpdateRef.current = true;
+        setTeachers(data?.teachers || []);
+        setOverrides(data?.overrides || {});
+        setOneOffs(data?.oneOffs || []);
+        setPayments(data?.payments || []);
+        setLoaded(true);
+        setSyncState('synced');
+      },
+      () => {
+        setLoaded(true);
+        setSyncState('offline');
+      }
+    );
+    return unsub;
+  }, [user]);
+
+  /* ---- push local changes to Firestore (debounced), skip the echo from onSnapshot ---- */
+  useEffect(() => {
+    if (!loaded || !user) return;
+    if (remoteUpdateRef.current) {
+      remoteUpdateRef.current = false;
       saveData({ teachers, overrides, oneOffs, payments });
-    }, 400);
+      return;
+    }
+    const t = setTimeout(async () => {
+      saveData({ teachers, overrides, oneOffs, payments });
+      try {
+        await setDoc(doc(db, 'households', user.uid), {
+          teachers, overrides, oneOffs, payments, updatedAt: Date.now(),
+        });
+        setSyncState('synced');
+      } catch (e) {
+        setSyncState('offline');
+      }
+    }, 500);
     return () => clearTimeout(t);
-  }, [teachers, overrides, oneOffs, payments, loaded]);
+  }, [teachers, overrides, oneOffs, payments, loaded, user]);
 
   /* ---- toast auto-dismiss ---- */
   useEffect(() => {
@@ -457,12 +517,16 @@ export default function App() {
 
   /* ---------------------------------- render ---------------------------------- */
 
-  if (!loaded) {
+  if (!authChecked || (user && !loaded)) {
     return (
       <div className="min-h-screen bg-[#0A0C10] flex items-center justify-center">
         <div className="w-8 h-8 rounded-full border-2 border-[#F2B84B] border-t-transparent animate-spin" />
       </div>
     );
+  }
+
+  if (!user) {
+    return <AuthScreen />;
   }
 
   return (
@@ -507,6 +571,9 @@ export default function App() {
             onOpenSession={setActionModal}
             onGoTeachers={() => setTab('teachers')}
             onPay={(id) => setPayConfirm(id)}
+            syncState={syncState}
+            userEmail={user.email}
+            onSignOut={() => signOut(auth)}
           />
         )}
 
@@ -623,11 +690,12 @@ export default function App() {
 function HomeView({
   teachers, todaySessions, upcomingSessions, teacherMap, dueTeachers,
   monthSpent, unpaidSessionsCount, notifPermission, onRequestNotif,
-  onOpenSession, onGoTeachers, onPay,
+  onOpenSession, onGoTeachers, onPay, syncState, userEmail, onSignOut,
 }) {
   const now = new Date();
   const hour = now.getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+  const [showAccount, setShowAccount] = useState(false);
 
   return (
     <div className="px-5 pt-8 animate-fadeIn">
@@ -636,16 +704,59 @@ function HomeView({
           <p className="text-[#8B92A3] text-sm">{greeting}</p>
           <h1 className="font-display text-2xl font-semibold mt-0.5">Bac Tracker</h1>
         </div>
-        {notifPermission !== 'granted' && notifPermission !== 'unsupported' && (
+        <div className="flex items-center gap-2">
+          {notifPermission !== 'granted' && notifPermission !== 'unsupported' && (
+            <IconBtn
+              onClick={onRequestNotif}
+              label="Enable notifications"
+              className="w-10 h-10 bg-[#141822] border border-[#232733] text-[#F2B84B]"
+            >
+              <Bell size={18} />
+            </IconBtn>
+          )}
           <IconBtn
-            onClick={onRequestNotif}
-            label="Enable notifications"
-            className="w-10 h-10 bg-[#141822] border border-[#232733] text-[#F2B84B]"
+            onClick={() => setShowAccount(true)}
+            label="Account"
+            className="w-10 h-10 bg-[#141822] border border-[#232733]"
           >
-            <Bell size={18} />
+            {syncState === 'synced' ? (
+              <Cloud size={17} className="text-[#34D399]" />
+            ) : (
+              <CloudOff size={17} className="text-[#8B92A3]" />
+            )}
           </IconBtn>
-        )}
+        </div>
       </div>
+
+      {showAccount && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center px-6">
+          <div className="absolute inset-0 bg-black/60 animate-fadeIn" onClick={() => setShowAccount(false)} />
+          <div className="relative w-full max-w-sm bg-[#171B24] border border-[#232733] rounded-2xl p-5 animate-slideUp">
+            <h3 className="font-display font-semibold text-base mb-1">Synced account</h3>
+            <p className="text-sm text-[#8B92A3] mb-1">Signed in as</p>
+            <p className="text-sm font-medium mb-4 break-all">{userEmail}</p>
+            <p className="text-xs text-[#5C6270] mb-5">
+              {syncState === 'synced'
+                ? 'Data is syncing live. Sign in with this same email and password on another phone to see the same teachers, sessions, and payments there.'
+                : "Couldn't reach the sync server — changes are saved on this phone and will sync once you're back online."}
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowAccount(false)}
+                className="flex-1 py-2.5 rounded-xl bg-[#1B2030] text-[#F4F5F7] text-sm font-medium active:scale-95 transition-transform"
+              >
+                Close
+              </button>
+              <button
+                onClick={onSignOut}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[#2E1418] text-[#F2536B] text-sm font-semibold active:scale-95 transition-transform"
+              >
+                <LogOut size={15} /> Sign out
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {teachers.length === 0 ? (
         <div className="mt-10 text-center py-14 px-4 rounded-3xl bg-[#12151C] border border-[#1E222C]">
@@ -1395,6 +1506,126 @@ function RescheduleModal({ session, onClose, onSave }) {
       </button>
       <p className="text-[11px] text-[#5C6270] mt-3 text-center">This only moves this one lesson &mdash; future recurring slots stay the same.</p>
     </ModalShell>
+  );
+}
+
+/* ---------------------------------- Auth screen ---------------------------------- */
+
+function AuthScreen() {
+  const [mode, setMode] = useState('signin'); // signin | signup
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (!email.trim() || !password) {
+      setError('Enter an email and password.');
+      return;
+    }
+    if (password.length < 6) {
+      setError('Password needs at least 6 characters.');
+      return;
+    }
+    setError('');
+    setBusy(true);
+    try {
+      if (mode === 'signin') {
+        await signInWithEmailAndPassword(auth, email.trim(), password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email.trim(), password);
+      }
+    } catch (err) {
+      const map = {
+        'auth/invalid-email': 'That email address looks invalid.',
+        'auth/user-not-found': 'No account with that email. Try creating one instead.',
+        'auth/wrong-password': 'Wrong password.',
+        'auth/invalid-credential': 'Email or password is incorrect.',
+        'auth/email-already-in-use': 'An account already exists with that email — sign in instead.',
+        'auth/weak-password': 'Password needs at least 6 characters.',
+      };
+      setError(map[err.code] || 'Something went wrong. Check your connection and try again.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="min-h-screen bg-[#0A0C10] text-[#F4F5F7] flex justify-center"
+      style={{ fontFamily: "'Inter', system-ui, sans-serif" }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+        .font-display { font-family: 'Space Grotesk', system-ui, sans-serif; }
+      `}</style>
+      <div className="w-full max-w-md min-h-screen flex flex-col justify-center px-6">
+        <div className="mb-8 text-center">
+          <div className="w-14 h-14 rounded-2xl bg-[#F2B84B22] flex items-center justify-center mx-auto mb-4">
+            <Sparkles className="text-[#F2B84B]" size={26} />
+          </div>
+          <h1 className="font-display text-2xl font-semibold">Bac Tracker</h1>
+          <p className="text-[#8B92A3] text-sm mt-1.5">
+            {mode === 'signin' ? 'Sign in to sync your teachers and sessions.' : 'Create an account to sync across your phones.'}
+          </p>
+        </div>
+
+        <form onSubmit={handleSubmit} className="rounded-2xl bg-[#12151C] border border-[#1E222C] p-5">
+          <Field label="Email">
+            <div className="relative">
+              <Mail size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#5C6270]" />
+              <input
+                type="email"
+                autoComplete="email"
+                className={inputCls + ' pl-10'}
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@example.com"
+              />
+            </div>
+          </Field>
+          <Field label="Password">
+            <div className="relative">
+              <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#5C6270]" />
+              <input
+                type="password"
+                autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}
+                className={inputCls + ' pl-10'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="At least 6 characters"
+              />
+            </div>
+          </Field>
+
+          {error && <p className="text-xs text-[#F2536B] mb-3">{error}</p>}
+
+          <button
+            type="submit"
+            disabled={busy}
+            className="w-full py-3 rounded-xl bg-[#F2B84B] text-[#241A05] font-semibold text-sm active:scale-[0.98] transition-transform disabled:opacity-60"
+          >
+            {busy ? 'Please wait…' : mode === 'signin' ? 'Sign in' : 'Create account'}
+          </button>
+        </form>
+
+        <button
+          onClick={() => { setMode(mode === 'signin' ? 'signup' : 'signin'); setError(''); }}
+          className="mt-5 text-sm text-[#8B92A3] text-center"
+        >
+          {mode === 'signin' ? (
+            <>No account yet? <span className="text-[#F2B84B] font-medium">Create one</span></>
+          ) : (
+            <>Already have an account? <span className="text-[#F2B84B] font-medium">Sign in</span></>
+          )}
+        </button>
+
+        <p className="text-[11px] text-[#5C6270] text-center mt-6 leading-relaxed">
+          Sign in with the same email and password on another phone to see the same data there, live.
+        </p>
+      </div>
+    </div>
   );
 }
 
