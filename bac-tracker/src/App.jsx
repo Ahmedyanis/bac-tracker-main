@@ -3,7 +3,8 @@ import {
   Home, Users, Calendar as CalendarIcon, Wallet, Plus, X, Phone, MessageCircle,
   Check, XCircle, Clock, ChevronLeft, ChevronRight, Bell, MapPin, Edit2, Trash2,
   RotateCcw, CheckCircle2, AlertTriangle, TrendingUp, Ticket, ArrowUpRight,
-  ArrowDownRight, CalendarPlus, BellRing, Sparkles, LogOut, Cloud, CloudOff, Mail, Lock
+  ArrowDownRight, CalendarPlus, BellRing, Sparkles, LogOut, Cloud, CloudOff, Mail, Lock,
+  GraduationCap, LayoutGrid,
 } from 'lucide-react';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
@@ -11,48 +12,28 @@ import {
 } from 'firebase/auth';
 import { doc, onSnapshot, setDoc } from 'firebase/firestore';
 import { auth, db } from './firebase';
+import {
+  DAY_LABELS, DAY_LABELS_FULL, MONTH_LABELS, SUBJECT_COLORS,
+  uid, toKey, fromKey, addDays, startOfDay, formatDateLabel,
+  IconBtn, ModalShell, ConfirmModal, Field, inputCls,
+} from './shared.jsx';
+import StudentHub from './StudentHub';
+import MasterCalendar from './MasterCalendar';
+import { SUBJECTS } from './subjects';
 
 /* ---------------------------------- constants ---------------------------------- */
 
-const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const DAY_LABELS_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-const MONTH_LABELS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-
-const SUBJECT_COLORS = [
-  '#F2B84B', '#34D399', '#5B8DEF', '#F2536B',
-  '#B980F0', '#4FD1C5', '#FB923C', '#F472B6',
-];
-
 const STORAGE_KEY = 'bac-tracker-v1';
+const HUB_STORAGE_KEY = 'bac-tracker-hub-v1';
 
 /* ---------------------------------- helpers ---------------------------------- */
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-}
-
-function toKey(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-function fromKey(key) {
-  const [y, m, d] = key.split('-').map(Number);
-  return new Date(y, m - 1, d);
-}
-
-function addDays(date, n) {
-  const d = new Date(date);
-  d.setDate(d.getDate() + n);
-  return d;
-}
-
-function startOfDay(d) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
+function emptySubjectsData() {
+  const out = {};
+  SUBJECTS.forEach((s) => {
+    out[s.key] = { items: [], curriculum: [], log: [], quizAttempts: [] };
+  });
+  return out;
 }
 
 function formatDZD(n) {
@@ -66,15 +47,6 @@ function formatTime12(t) {
   const period = h >= 12 ? 'PM' : 'AM';
   const hh = h % 12 === 0 ? 12 : h % 12;
   return `${hh}:${String(m).padStart(2, '0')} ${period}`;
-}
-
-function formatDateLabel(key) {
-  const d = fromKey(key);
-  const today = startOfDay(new Date());
-  const tmr = addDays(today, 1);
-  if (toKey(d) === toKey(today)) return 'Today';
-  if (toKey(d) === toKey(tmr)) return 'Tomorrow';
-  return `${DAY_LABELS[d.getDay()]}, ${MONTH_LABELS[d.getMonth()].slice(0, 3)} ${d.getDate()}`;
 }
 
 function combineDateTime(dateKey, time) {
@@ -170,18 +142,6 @@ function generateSessions(teachers, overrides, oneOffs, rangeStart, rangeEnd) {
 
 /* ---------------------------------- small UI atoms ---------------------------------- */
 
-function IconBtn({ onClick, children, className = '', label }) {
-  return (
-    <button
-      onClick={onClick}
-      aria-label={label}
-      className={`flex items-center justify-center rounded-xl transition-all duration-200 active:scale-90 ${className}`}
-    >
-      {children}
-    </button>
-  );
-}
-
 function StatusPill({ status }) {
   const map = {
     scheduled: { bg: 'bg-[#1B2030]', text: 'text-[#8B92A3]', label: 'Scheduled' },
@@ -237,8 +197,10 @@ export default function App() {
   const [overrides, setOverrides] = useState({});
   const [oneOffs, setOneOffs] = useState([]);
   const [payments, setPayments] = useState([]);
+  const [subjectsData, setSubjectsData] = useState(emptySubjectsData());
   const [loaded, setLoaded] = useState(false);
 
+  const [mainTab, setMainTab] = useState('tutor'); // tutor | hub | calendar
   const [tab, setTab] = useState('home');
   const [teacherModal, setTeacherModal] = useState(null); // null | 'new' | teacherId
   const [confirmDelete, setConfirmDelete] = useState(null); // teacherId
@@ -281,6 +243,7 @@ export default function App() {
         setOverrides(cached.overrides || {});
         setOneOffs(cached.oneOffs || []);
         setPayments(cached.payments || []);
+        setSubjectsData({ ...emptySubjectsData(), ...(cached.subjectsData || {}) });
       }
     })();
   }, [user]);
@@ -301,6 +264,7 @@ export default function App() {
         setOverrides(data?.overrides || {});
         setOneOffs(data?.oneOffs || []);
         setPayments(data?.payments || []);
+        setSubjectsData({ ...emptySubjectsData(), ...(data?.subjectsData || {}) });
         setLoaded(true);
         setSyncState('synced');
       },
@@ -317,14 +281,14 @@ export default function App() {
     if (!loaded || !user) return;
     if (remoteUpdateRef.current) {
       remoteUpdateRef.current = false;
-      saveData({ teachers, overrides, oneOffs, payments });
+      saveData({ teachers, overrides, oneOffs, payments, subjectsData });
       return;
     }
     const t = setTimeout(async () => {
-      saveData({ teachers, overrides, oneOffs, payments });
+      saveData({ teachers, overrides, oneOffs, payments, subjectsData });
       try {
         await setDoc(doc(db, 'households', user.uid), {
-          teachers, overrides, oneOffs, payments, updatedAt: Date.now(),
+          teachers, overrides, oneOffs, payments, subjectsData, updatedAt: Date.now(),
         });
         setSyncState('synced');
       } catch (e) {
@@ -332,7 +296,7 @@ export default function App() {
       }
     }, 500);
     return () => clearTimeout(t);
-  }, [teachers, overrides, oneOffs, payments, loaded, user]);
+  }, [teachers, overrides, oneOffs, payments, subjectsData, loaded, user]);
 
   /* ---- toast auto-dismiss ---- */
   useEffect(() => {
@@ -557,7 +521,22 @@ export default function App() {
           </div>
         )}
 
-        {tab === 'home' && (
+        <MainTabBar mainTab={mainTab} setMainTab={setMainTab} />
+
+        {mainTab === 'hub' && (
+          <StudentHub subjectsData={subjectsData} setSubjectsData={setSubjectsData} />
+        )}
+
+        {mainTab === 'calendar' && (
+          <MasterCalendar
+            allSessions={allSessions}
+            teacherMap={teacherMap}
+            payments={payments}
+            subjectsData={subjectsData}
+          />
+        )}
+
+        {mainTab === 'tutor' && tab === 'home' && (
           <HomeView
             teachers={teachers}
             todaySessions={todaySessions}
@@ -577,7 +556,7 @@ export default function App() {
           />
         )}
 
-        {tab === 'teachers' && (
+        {mainTab === 'tutor' && tab === 'teachers' && (
           <TeachersView
             teachers={teachers}
             onAdd={() => setTeacherModal('new')}
@@ -587,7 +566,7 @@ export default function App() {
           />
         )}
 
-        {tab === 'calendar' && (
+        {mainTab === 'tutor' && tab === 'calendar' && (
           <CalendarView
             monthCursor={monthCursor}
             setMonthCursor={setMonthCursor}
@@ -601,7 +580,7 @@ export default function App() {
           />
         )}
 
-        {tab === 'ledger' && (
+        {mainTab === 'tutor' && tab === 'ledger' && (
           <LedgerView
             totalSpent={totalSpent}
             monthSpent={monthSpent}
@@ -613,7 +592,7 @@ export default function App() {
           />
         )}
 
-        <BottomNav tab={tab} setTab={setTab} />
+        {mainTab === 'tutor' && <BottomNav tab={tab} setTab={setTab} />}
 
         {/* ---- modals ---- */}
         {teacherModal && (
@@ -1179,6 +1158,35 @@ function LedgerView({ totalSpent, monthSpent, unpaidSessionsCount, teachers, spe
 
 /* ---------------------------------- Bottom nav ---------------------------------- */
 
+function MainTabBar({ mainTab, setMainTab }) {
+  const items = [
+    { id: 'tutor', icon: Users, label: 'Tutor & Packs' },
+    { id: 'hub', icon: GraduationCap, label: 'Student Hub' },
+    { id: 'calendar', icon: LayoutGrid, label: 'Master Calendar' },
+  ];
+  return (
+    <div className="px-5 pt-5">
+      <div className="flex items-center gap-1 p-1 rounded-2xl bg-[#12151C] border border-[#1E222C]">
+        {items.map((it) => {
+          const Icon = it.icon;
+          const active = mainTab === it.id;
+          return (
+            <button
+              key={it.id}
+              onClick={() => setMainTab(it.id)}
+              className="flex-1 flex flex-col items-center gap-1 py-2 rounded-xl transition-all duration-200"
+              style={active ? { background: '#1B2030' } : undefined}
+            >
+              <Icon size={16} className={active ? 'text-[#F2B84B]' : 'text-[#5C6270]'} strokeWidth={active ? 2.4 : 2} />
+              <span className={`text-[9.5px] font-medium leading-tight text-center ${active ? 'text-[#F2B84B]' : 'text-[#5C6270]'}`}>{it.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function BottomNav({ tab, setTab }) {
   const items = [
     { id: 'home', icon: Home, label: 'Home' },
@@ -1207,67 +1215,6 @@ function BottomNav({ tab, setTab }) {
     </div>
   );
 }
-
-/* ---------------------------------- Modal shell ---------------------------------- */
-
-function ModalShell({ children, onClose, title }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center">
-      <div className="absolute inset-0 bg-black/60 animate-fadeIn" onClick={onClose} />
-      <div className="relative w-full max-w-md bg-[#12151C] border-t border-[#232733] rounded-t-3xl max-h-[88vh] overflow-y-auto animate-slideUp">
-        <div className="sticky top-0 bg-[#12151C] flex items-center justify-between px-5 pt-5 pb-3 border-b border-[#1E222C]">
-          <h2 className="font-display text-lg font-semibold">{title}</h2>
-          <IconBtn onClick={onClose} label="Close" className="w-8 h-8 bg-[#1B2030] text-[#8B92A3]">
-            <X size={16} />
-          </IconBtn>
-        </div>
-        <div className="px-5 py-5">{children}</div>
-      </div>
-    </div>
-  );
-}
-
-function ConfirmModal({ title, body, confirmLabel, danger, onCancel, onConfirm }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center px-6">
-      <div className="absolute inset-0 bg-black/60 animate-fadeIn" onClick={onCancel} />
-      <div className="relative w-full max-w-sm bg-[#171B24] border border-[#232733] rounded-2xl p-5 animate-slideUp">
-        <h3 className="font-display font-semibold text-base mb-2">{title}</h3>
-        <p className="text-sm text-[#8B92A3] mb-5">{body}</p>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onCancel}
-            className="flex-1 py-2.5 rounded-xl bg-[#1B2030] text-[#F4F5F7] text-sm font-medium active:scale-95 transition-transform"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            className={`flex-1 py-2.5 rounded-xl text-sm font-semibold active:scale-95 transition-transform ${
-              danger ? 'bg-[#F2536B] text-[#2E0F16]' : 'bg-[#F2B84B] text-[#241A05]'
-            }`}
-          >
-            {confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ---------------------------------- Form field atoms ---------------------------------- */
-
-function Field({ label, children }) {
-  return (
-    <div className="mb-4">
-      <label className="block text-xs font-medium text-[#8B92A3] mb-1.5">{label}</label>
-      {children}
-    </div>
-  );
-}
-
-const inputCls =
-  'w-full bg-[#0F1218] border border-[#232733] rounded-xl px-3.5 py-2.5 text-sm text-[#F4F5F7] placeholder-[#5C6270] outline-none focus:border-[#F2B84B] transition-colors';
 
 /* ---------------------------------- Teacher form modal ---------------------------------- */
 

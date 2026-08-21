@@ -4,6 +4,27 @@ Mobile-first Bac lesson and teacher tracking app. React + Tailwind CSS + Lucide 
 Data syncs live across phones through Firebase (sign in with the same email/password on
 each phone), with a local cache so the app still works offline.
 
+## What's in the app
+
+Three top-level tabs (segmented control at the top of the screen):
+
+- **Tutor & Packs** — the original app: teachers, weekly sessions, pack tracking, payments,
+  and its own Home / Teachers / Calendar / Ledger bottom nav, unchanged.
+- **Student Hub** — pick a subject (Islamic Education, History, Math, Physics, Science,
+  English, Computer Science), then work through three sub-tabs for it:
+  - *Practice*: add subject-specific study material and quiz yourself on it (Math gets a
+    text input plus a toggleable math-symbol keypad: √ x² xⁿ π ∫ ∑ ÷ ∞ ± ≤ ≥ ≠ θ). A
+    "Scoring & analytics" panel tracks accuracy, streak, and weak areas per subject.
+  - *Curriculum*: log units/sub-lessons from the official syllabus, mark them done, rate
+    your understanding 0–100%, and log a completion date — with an auto-calculated
+    progress bar.
+  - *Calendar*: a month view filtered to that subject's logged lessons and quiz attempts.
+- **Master Calendar** — one month view aggregating tutor sessions, pack payments, and all
+  Student Hub activity, color-coded with a legend.
+
+All of this (subjects, curriculum, quiz history, calendar logs) syncs through the same
+Firebase document as the tutor data, with the same offline-first local cache.
+
 ## 0. Set up Firebase (do this once, before deploying)
 
 1. Go to [console.firebase.google.com](https://console.firebase.google.com) and click
