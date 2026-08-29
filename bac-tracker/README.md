@@ -22,6 +22,22 @@ Three top-level tabs (segmented control at the top of the screen):
 - **Master Calendar** — one month view aggregating tutor sessions, pack payments, and all
   Student Hub activity, color-coded with a legend.
 
+### Recent additions
+
+- **Flexible teachers** — toggle "No fixed schedule" on a teacher to skip the weekly slot
+  requirement entirely. Their card gets a "Schedule next session" button instead, which opens
+  the one-off scheduler locked to that teacher with quick "Today / In 1 week / In 2 weeks"
+  date shortcuts. Flexible teachers never auto-generate recurring calendar placeholders.
+- **8-session packs** — the rate-type dropdown now has three options: per session, per
+  4-session pack, or per 8-session pack. The pack tracker, due alerts, and payment math all
+  scale to whichever size is selected.
+- **First session / start date** — every teacher now has a required start date. The calendar
+  engine won't generate any recurring weekly sessions before it, so old or arbitrary default
+  dates can't clutter the calendar.
+- **Delete account** — in the account panel (cloud icon on Home), "Delete account" wipes the
+  Firestore document, clears the local cache, and deletes the Firebase Auth account itself,
+  after a confirmation step. This is permanent.
+
 All of this (subjects, curriculum, quiz history, calendar logs) syncs through the same
 Firebase document as the tutor data, with the same offline-first local cache.
 

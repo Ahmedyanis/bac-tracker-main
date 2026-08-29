@@ -8,9 +8,9 @@ import {
 } from 'lucide-react';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-  signOut,
+  signOut, deleteUser,
 } from 'firebase/auth';
-import { doc, onSnapshot, setDoc } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
 import { auth, db } from './firebase';
 import {
   DAY_LABELS, DAY_LABELS_FULL, MONTH_LABELS, SUBJECT_COLORS,
@@ -60,6 +60,14 @@ function normalizePhone(phone) {
   return (phone || '').replace(/[^\d+]/g, '');
 }
 
+// The number of sessions in a teacher's payment cycle, derived from their rate type.
+// 'session' = pay each time (cycle length 1), 'pack'/'pack4' = 4-session pack, 'pack8' = 8-session pack.
+function packSizeFor(rateType) {
+  if (rateType === 'pack8') return 8;
+  if (rateType === 'pack' || rateType === 'pack4') return 4;
+  return 1;
+}
+
 /* ---------------------------------- storage ---------------------------------- */
 
 async function loadData() {
@@ -88,8 +96,14 @@ function generateSessions(teachers, overrides, oneOffs, rangeStart, rangeEnd) {
   const out = [];
 
   teachers.forEach((t) => {
+    // Flexible ("no fixed schedule") teachers never auto-populate recurring placeholders —
+    // their sessions are always scheduled one at a time as one-offs.
+    if (t.flexible) return;
+
     (t.weeklySlots || []).forEach((slot) => {
-      let d = startOfDay(rangeStart);
+      // Never generate recurring placeholders before the teacher's chosen start date.
+      const clampedStart = t.startDate ? new Date(Math.max(startOfDay(rangeStart), startOfDay(fromKey(t.startDate)))) : startOfDay(rangeStart);
+      let d = clampedStart;
       const end = startOfDay(rangeEnd);
       while (d <= end) {
         if (d.getDay() === slot.day) {
@@ -156,12 +170,14 @@ function StatusPill({ status }) {
   );
 }
 
-// Signature element: a "ticket stub" style 4-segment pack tracker
-function PackTicket({ count, color, size = 'md' }) {
-  const segs = [0, 1, 2, 3];
-  const dim = size === 'sm' ? 'h-6 w-6' : 'h-8 w-8';
+// Signature element: a "ticket stub" style N-segment pack tracker (4 or 8 sessions)
+function PackTicket({ count, color, packSize = 4, size = 'md' }) {
+  const segs = Array.from({ length: packSize }, (_, i) => i);
+  // Shrink segments and gap when packing 8 into the same card width as 4 used to take.
+  const dim = packSize > 4 ? 'h-5 w-5' : size === 'sm' ? 'h-6 w-6' : 'h-8 w-8';
+  const gap = packSize > 4 ? 'gap-1' : 'gap-1.5';
   return (
-    <div className="flex items-center gap-1.5">
+    <div className={`flex items-center flex-wrap ${gap}`}>
       {segs.map((i) => {
         const filled = i < count;
         return (
@@ -177,9 +193,9 @@ function PackTicket({ count, color, size = 'md' }) {
             {filled && (
               <div className="rounded-sm" style={{ width: '45%', height: '45%', background: color }} />
             )}
-            {i < 3 && (
+            {i < packSize - 1 && (
               <div
-                className="absolute -right-1.5 top-1/2 -translate-y-1/2 w-1 h-1 rounded-full"
+                className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-1 rounded-full"
                 style={{ background: '#0A0C10', border: '1px solid #2A2F3B' }}
               />
             )}
@@ -372,7 +388,8 @@ export default function App() {
     () =>
       teachers.filter((t) => {
         const count = t.packCount || 0;
-        return t.dueTiming === 'first' ? count >= 1 : count >= 4;
+        const packSize = packSizeFor(t.rateType);
+        return t.dueTiming === 'first' ? count >= 1 : count >= packSize;
       }),
     [teachers]
   );
@@ -435,7 +452,8 @@ export default function App() {
         prev.map((t) => {
           if (t.id !== session.teacherId) return t;
           let count = t.packCount || 0;
-          count = willAttend ? Math.min(4, count + 1) : Math.max(0, count - 1);
+          const packSize = packSizeFor(t.rateType);
+          count = willAttend ? Math.min(packSize, count + 1) : Math.max(0, count - 1);
           return { ...t, packCount: count };
         })
       );
@@ -469,7 +487,8 @@ export default function App() {
   function markPackPaid(teacherId) {
     const t = teacherMap[teacherId];
     if (!t) return;
-    const amount = t.rateType === 'pack' ? t.fee : t.fee * 4;
+    const packSize = packSizeFor(t.rateType);
+    const amount = t.rateType === 'session' ? t.fee * packSize : t.fee;
     setPayments((prev) => [
       ...prev,
       { id: uid(), teacherId, amount, date: toKey(new Date()) },
@@ -477,6 +496,30 @@ export default function App() {
     setTeachers((prev) => prev.map((x) => (x.id === teacherId ? { ...x, packCount: 0 } : x)));
     setPayConfirm(null);
     setToast(`${formatDZD(amount)} logged for ${t.name}`);
+  }
+
+  /* ---- account deletion: wipes Firestore, local cache, and the auth account itself ---- */
+  async function deleteAccount() {
+    // Always clear the local fallback cache, regardless of how far Firestore/Auth get.
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (e) {
+      /* best effort */
+    }
+    if (user) {
+      try {
+        await deleteDoc(doc(db, 'households', user.uid));
+      } catch (e) {
+        /* proceed even if this fails (e.g. offline) — Auth deletion below still runs */
+      }
+      await deleteUser(auth.currentUser);
+    }
+    // Reset in-memory state so nothing lingers even if the auth listener is slow to fire.
+    setTeachers([]);
+    setOverrides({});
+    setOneOffs([]);
+    setPayments([]);
+    setSubjectsData(emptySubjectsData());
   }
 
   /* ---------------------------------- render ---------------------------------- */
@@ -553,6 +596,7 @@ export default function App() {
             syncState={syncState}
             userEmail={user.email}
             onSignOut={() => signOut(auth)}
+            onDeleteAccount={deleteAccount}
           />
         )}
 
@@ -563,6 +607,7 @@ export default function App() {
             onEdit={(id) => setTeacherModal(id)}
             onDelete={(id) => setConfirmDelete(id)}
             onPay={(id) => setPayConfirm(id)}
+            onScheduleSession={(teacherId) => setOneOffModal({ date: toKey(new Date()), teacherId })}
           />
         )}
 
@@ -617,19 +662,20 @@ export default function App() {
           />
         )}
 
-        {payConfirm && teacherMap[payConfirm] && (
-          <ConfirmModal
-            title="Mark pack as paid?"
-            body={`Log a payment of ${formatDZD(
-              teacherMap[payConfirm].rateType === 'pack'
-                ? teacherMap[payConfirm].fee
-                : teacherMap[payConfirm].fee * 4
-            )} for ${teacherMap[payConfirm].name} and reset the cycle to 0/4.`}
-            confirmLabel="Mark paid"
-            onCancel={() => setPayConfirm(null)}
-            onConfirm={() => markPackPaid(payConfirm)}
-          />
-        )}
+        {payConfirm && teacherMap[payConfirm] && (() => {
+          const t = teacherMap[payConfirm];
+          const packSize = packSizeFor(t.rateType);
+          const amount = t.rateType === 'session' ? t.fee * packSize : t.fee;
+          return (
+            <ConfirmModal
+              title="Mark pack as paid?"
+              body={`Log a payment of ${formatDZD(amount)} for ${t.name} and reset the cycle to 0/${packSize}.`}
+              confirmLabel="Mark paid"
+              onCancel={() => setPayConfirm(null)}
+              onConfirm={() => markPackPaid(payConfirm)}
+            />
+          );
+        })()}
 
         {actionModal && (
           <SessionActionModal
@@ -654,6 +700,7 @@ export default function App() {
         {oneOffModal && (
           <OneOffModal
             defaultDate={oneOffModal.date}
+            lockedTeacherId={oneOffModal.teacherId}
             teachers={teachers}
             onClose={() => setOneOffModal(null)}
             onSave={addOneOff}
@@ -669,12 +716,31 @@ export default function App() {
 function HomeView({
   teachers, todaySessions, upcomingSessions, teacherMap, dueTeachers,
   monthSpent, unpaidSessionsCount, notifPermission, onRequestNotif,
-  onOpenSession, onGoTeachers, onPay, syncState, userEmail, onSignOut,
+  onOpenSession, onGoTeachers, onPay, syncState, userEmail, onSignOut, onDeleteAccount,
 }) {
   const now = new Date();
   const hour = now.getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
   const [showAccount, setShowAccount] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
+
+  async function handleDeleteAccount() {
+    setDeleteError('');
+    setDeleting(true);
+    try {
+      await onDeleteAccount();
+      // Success: the auth listener at the App level will flip to the sign-in screen.
+    } catch (err) {
+      setDeleting(false);
+      if (err && err.code === 'auth/requires-recent-login') {
+        setDeleteError('For your security, please sign out and sign back in, then try deleting your account again.');
+      } else {
+        setDeleteError('Something went wrong deleting your account. Check your connection and try again.');
+      }
+    }
+  }
 
   return (
     <div className="px-5 pt-8 animate-fadeIn">
@@ -733,8 +799,29 @@ function HomeView({
                 <LogOut size={15} /> Sign out
               </button>
             </div>
+
+            <div className="mt-4 pt-4 border-t border-[#232733]">
+              {deleteError && <p className="text-xs text-[#F2536B] mb-3">{deleteError}</p>}
+              <button
+                onClick={() => setDeleteConfirmOpen(true)}
+                className="w-full py-2.5 rounded-xl border border-[#F2536B]/30 text-[#F2536B] text-xs font-semibold active:scale-95 transition-transform"
+              >
+                Delete account
+              </button>
+            </div>
           </div>
         </div>
+      )}
+
+      {deleteConfirmOpen && (
+        <ConfirmModal
+          title="Delete your account?"
+          body="This permanently deletes every teacher, session, payment, and Student Hub record tied to this account, on every device — this cannot be undone."
+          confirmLabel={deleting ? 'Deleting…' : 'Delete everything'}
+          danger
+          onCancel={() => { if (!deleting) setDeleteConfirmOpen(false); }}
+          onConfirm={() => { if (!deleting) handleDeleteAccount(); }}
+        />
       )}
 
       {teachers.length === 0 ? (
@@ -856,7 +943,7 @@ function SessionRow({ session, teacher, onClick, showDate }) {
 
 /* ---------------------------------- Teachers ---------------------------------- */
 
-function TeachersView({ teachers, onAdd, onEdit, onDelete, onPay }) {
+function TeachersView({ teachers, onAdd, onEdit, onDelete, onPay, onScheduleSession }) {
   return (
     <div className="px-5 pt-8 animate-fadeIn">
       <div className="flex items-center justify-between mb-5">
@@ -874,7 +961,14 @@ function TeachersView({ teachers, onAdd, onEdit, onDelete, onPay }) {
       ) : (
         <div className="space-y-3">
           {teachers.map((t) => (
-            <TeacherCard key={t.id} teacher={t} onEdit={() => onEdit(t.id)} onDelete={() => onDelete(t.id)} onPay={() => onPay(t.id)} />
+            <TeacherCard
+              key={t.id}
+              teacher={t}
+              onEdit={() => onEdit(t.id)}
+              onDelete={() => onDelete(t.id)}
+              onPay={() => onPay(t.id)}
+              onScheduleSession={() => onScheduleSession(t.id)}
+            />
           ))}
         </div>
       )}
@@ -882,9 +976,10 @@ function TeachersView({ teachers, onAdd, onEdit, onDelete, onPay }) {
   );
 }
 
-function TeacherCard({ teacher, onEdit, onDelete, onPay }) {
-  const isDue = teacher.dueTiming === 'first' ? (teacher.packCount || 0) >= 1 : (teacher.packCount || 0) >= 4;
-  const perSession = teacher.rateType === 'session' ? teacher.fee : teacher.fee / 4;
+function TeacherCard({ teacher, onEdit, onDelete, onPay, onScheduleSession }) {
+  const packSize = packSizeFor(teacher.rateType);
+  const isDue = teacher.dueTiming === 'first' ? (teacher.packCount || 0) >= 1 : (teacher.packCount || 0) >= packSize;
+  const perSession = teacher.rateType === 'session' ? teacher.fee : teacher.fee / packSize;
 
   return (
     <div className="rounded-2xl bg-[#12151C] border border-[#1E222C] p-4 animate-slideUp">
@@ -897,7 +992,14 @@ function TeacherCard({ teacher, onEdit, onDelete, onPay }) {
             {teacher.subject.slice(0, 2).toUpperCase()}
           </div>
           <div className="min-w-0">
-            <p className="font-medium text-sm truncate">{teacher.name}</p>
+            <div className="flex items-center gap-1.5">
+              <p className="font-medium text-sm truncate">{teacher.name}</p>
+              {teacher.flexible && (
+                <span className="shrink-0 px-1.5 py-0.5 rounded-full text-[9px] font-semibold bg-[#1B2030] text-[#8B92A3]">
+                  Flexible
+                </span>
+              )}
+            </div>
             <p className="text-xs text-[#8B92A3] truncate">{teacher.subject}</p>
           </div>
         </div>
@@ -911,10 +1013,14 @@ function TeacherCard({ teacher, onEdit, onDelete, onPay }) {
         </div>
       </div>
 
-      <div className="flex items-center justify-between mt-4">
-        <PackTicket count={teacher.packCount || 0} color={teacher.color} />
-        <span className="font-mono text-xs text-[#8B92A3]">{teacher.packCount || 0}/4</span>
-      </div>
+      {packSize > 1 ? (
+        <div className="flex items-center justify-between mt-4">
+          <PackTicket count={teacher.packCount || 0} color={teacher.color} packSize={packSize} />
+          <span className="font-mono text-xs text-[#8B92A3]">{teacher.packCount || 0}/{packSize}</span>
+        </div>
+      ) : (
+        <p className="text-[11px] text-[#5C6270] mt-4">Pay-per-session — due after every attended session.</p>
+      )}
 
       <div className="flex items-center gap-4 mt-3 text-xs text-[#8B92A3]">
         <span className="font-mono">{formatDZD(perSession)}/session</span>
@@ -924,6 +1030,15 @@ function TeacherCard({ teacher, onEdit, onDelete, onPay }) {
           </span>
         )}
       </div>
+
+      {teacher.flexible && (
+        <button
+          onClick={onScheduleSession}
+          className="w-full mt-3 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-[#1B2030] text-[#F2B84B] text-xs font-medium active:scale-95 transition-transform"
+        >
+          <CalendarPlus size={13} /> Schedule next session
+        </button>
+      )}
 
       {isDue && (
         <div className="mt-3 flex items-center justify-between rounded-xl px-3 py-2" style={{ background: '#2E1A14' }}>
@@ -1227,6 +1342,8 @@ function TeacherFormModal({ teacher, onClose, onSave }) {
   const [location, setLocation] = useState(teacher?.location || '');
   const [dueTiming, setDueTiming] = useState(teacher?.dueTiming || 'last');
   const [phone, setPhone] = useState(teacher?.phone || '');
+  const [flexible, setFlexible] = useState(teacher?.flexible || false);
+  const [startDate, setStartDate] = useState(teacher?.startDate || toKey(new Date()));
   const [slots, setSlots] = useState(teacher?.weeklySlots?.length ? teacher.weeklySlots : [{ id: uid(), day: 2, time: '17:00' }]);
   const [error, setError] = useState('');
 
@@ -1249,8 +1366,12 @@ function TeacherFormModal({ teacher, onClose, onSave }) {
       setError('Enter a valid fee amount.');
       return;
     }
-    if (slots.length === 0) {
-      setError('Add at least one weekly slot.');
+    if (!startDate) {
+      setError('Pick a first session / start date.');
+      return;
+    }
+    if (!flexible && slots.length === 0) {
+      setError('Add at least one weekly slot, or switch to a flexible schedule.');
       return;
     }
     setError('');
@@ -1264,7 +1385,9 @@ function TeacherFormModal({ teacher, onClose, onSave }) {
       location: location.trim(),
       dueTiming,
       phone: phone.trim(),
-      weeklySlots: slots,
+      flexible,
+      startDate,
+      weeklySlots: flexible ? [] : slots,
       packCount: teacher?.packCount || 0,
     });
   }
@@ -1301,6 +1424,7 @@ function TeacherFormModal({ teacher, onClose, onSave }) {
           <select className={inputCls} value={rateType} onChange={(e) => setRateType(e.target.value)}>
             <option value="session">Per session</option>
             <option value="pack">Per 4-session pack</option>
+            <option value="pack8">Per 8-session pack</option>
           </select>
         </Field>
       </div>
@@ -1309,46 +1433,87 @@ function TeacherFormModal({ teacher, onClose, onSave }) {
         <input className={inputCls} value={location} onChange={(e) => setLocation(e.target.value)} placeholder="e.g. Downtown center" />
       </Field>
 
-      <Field label="Payment due">
-        <select className={inputCls} value={dueTiming} onChange={(e) => setDueTiming(e.target.value)}>
-          <option value="first">First session of pack</option>
-          <option value="last">Last session of pack</option>
-        </select>
-      </Field>
+      {rateType !== 'session' && (
+        <Field label="Payment due">
+          <select className={inputCls} value={dueTiming} onChange={(e) => setDueTiming(e.target.value)}>
+            <option value="first">First session of pack</option>
+            <option value="last">Last session of pack</option>
+          </select>
+        </Field>
+      )}
 
       <Field label="Phone / WhatsApp number">
         <input className={inputCls} value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+213 5xx xxx xxx" />
       </Field>
 
-      <Field label="Weekly recurring slots">
-        <div className="space-y-2">
-          {slots.map((s) => (
-            <div key={s.id} className="flex items-center gap-2">
-              <select
-                className={inputCls + ' flex-1'}
-                value={s.day}
-                onChange={(e) => updateSlot(s.id, { day: Number(e.target.value) })}
-              >
-                {DAY_LABELS_FULL.map((d, idx) => (
-                  <option key={idx} value={idx}>{d}</option>
-                ))}
-              </select>
-              <input
-                type="time"
-                className={inputCls + ' w-28'}
-                value={s.time}
-                onChange={(e) => updateSlot(s.id, { time: e.target.value })}
-              />
-              <IconBtn onClick={() => removeSlot(s.id)} label="Remove slot" className="w-9 h-9 text-[#8B92A3] hover:text-[#F2536B] shrink-0">
-                <X size={16} />
-              </IconBtn>
-            </div>
-          ))}
-        </div>
-        <button onClick={addSlot} className="mt-2 flex items-center gap-1.5 text-xs font-medium text-[#F2B84B]">
-          <Plus size={14} /> Add another slot
-        </button>
+      <Field label="First session / start date">
+        <input type="date" className={inputCls} value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        <p className="text-[11px] text-[#5C6270] mt-1.5">The calendar won't generate any weekly sessions before this date.</p>
       </Field>
+
+      <div className="mb-4">
+        <button
+          type="button"
+          onClick={() => setFlexible((v) => !v)}
+          className={`w-full flex items-center justify-between px-4 py-3 rounded-xl border transition-colors ${
+            flexible ? 'bg-[#F2B84B22] border-[#F2B84B]' : 'bg-[#0F1218] border-[#232733]'
+          }`}
+        >
+          <div className="text-left pr-3">
+            <p className="text-sm font-medium">No fixed schedule</p>
+            <p className="text-xs text-[#8B92A3] mt-0.5">Flexible — schedule sessions one at a time instead of a weekly slot</p>
+          </div>
+          <div
+            className="w-10 h-6 rounded-full relative shrink-0 transition-colors"
+            style={{ background: flexible ? '#F2B84B' : '#2A2F3B' }}
+          >
+            <div
+              className="absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform"
+              style={{ transform: flexible ? 'translateX(18px)' : 'translateX(2px)' }}
+            />
+          </div>
+        </button>
+      </div>
+
+      {!flexible && (
+        <Field label="Weekly recurring slots">
+          <div className="space-y-2">
+            {slots.map((s) => (
+              <div key={s.id} className="flex items-center gap-2">
+                <select
+                  className={inputCls + ' flex-1'}
+                  value={s.day}
+                  onChange={(e) => updateSlot(s.id, { day: Number(e.target.value) })}
+                >
+                  {DAY_LABELS_FULL.map((d, idx) => (
+                    <option key={idx} value={idx}>{d}</option>
+                  ))}
+                </select>
+                <input
+                  type="time"
+                  className={inputCls + ' w-28'}
+                  value={s.time}
+                  onChange={(e) => updateSlot(s.id, { time: e.target.value })}
+                />
+                <IconBtn onClick={() => removeSlot(s.id)} label="Remove slot" className="w-9 h-9 text-[#8B92A3] hover:text-[#F2536B] shrink-0">
+                  <X size={16} />
+                </IconBtn>
+              </div>
+            ))}
+          </div>
+          <button onClick={addSlot} className="mt-2 flex items-center gap-1.5 text-xs font-medium text-[#F2B84B]">
+            <Plus size={14} /> Add another slot
+          </button>
+        </Field>
+      )}
+
+      {flexible && (
+        <div className="rounded-xl bg-[#0F1218] border border-[#232733] px-3.5 py-3 mb-4">
+          <p className="text-xs text-[#8B92A3]">
+            No weekly slot needed. Once saved, schedule each session individually from this teacher's card — a session or two at a time.
+          </p>
+        </div>
+      )}
 
       {error && <p className="text-xs text-[#F2536B] mb-3">{error}</p>}
 
@@ -1578,11 +1743,13 @@ function AuthScreen() {
 
 /* ---------------------------------- One-off session modal ---------------------------------- */
 
-function OneOffModal({ defaultDate, teachers, onClose, onSave }) {
-  const [teacherId, setTeacherId] = useState(teachers[0]?.id || '');
+function OneOffModal({ defaultDate, lockedTeacherId, teachers, onClose, onSave }) {
+  const [teacherId, setTeacherId] = useState(lockedTeacherId || teachers[0]?.id || '');
   const [date, setDate] = useState(defaultDate);
   const [time, setTime] = useState('17:00');
   const [error, setError] = useState('');
+
+  const lockedTeacher = lockedTeacherId ? teachers.find((t) => t.id === lockedTeacherId) : null;
 
   function handleSave() {
     if (!teacherId) {
@@ -1605,16 +1772,49 @@ function OneOffModal({ defaultDate, teachers, onClose, onSave }) {
   }
 
   return (
-    <ModalShell title="Add one-off session" onClose={onClose}>
-      <Field label="Teacher">
-        <select className={inputCls} value={teacherId} onChange={(e) => setTeacherId(e.target.value)}>
-          {teachers.map((t) => (
-            <option key={t.id} value={t.id}>{t.name} &middot; {t.subject}</option>
-          ))}
-        </select>
-      </Field>
+    <ModalShell title={lockedTeacher ? `Schedule with ${lockedTeacher.name}` : 'Add one-off session'} onClose={onClose}>
+      {lockedTeacher ? (
+        <Field label="Teacher">
+          <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-[#0F1218] border border-[#232733]">
+            <div className="w-2 h-2 rounded-full shrink-0" style={{ background: lockedTeacher.color }} />
+            <span className="text-sm">{lockedTeacher.name} &middot; {lockedTeacher.subject}</span>
+          </div>
+        </Field>
+      ) : (
+        <Field label="Teacher">
+          <select className={inputCls} value={teacherId} onChange={(e) => setTeacherId(e.target.value)}>
+            {teachers.map((t) => (
+              <option key={t.id} value={t.id}>{t.name} &middot; {t.subject}</option>
+            ))}
+          </select>
+        </Field>
+      )}
+
       <Field label="Date">
         <input type="date" className={inputCls} value={date} onChange={(e) => setDate(e.target.value)} />
+        <div className="flex items-center gap-2 mt-2">
+          <button
+            type="button"
+            onClick={() => setDate(toKey(new Date()))}
+            className="px-3 py-1.5 rounded-lg bg-[#1B2030] text-[#8B92A3] text-xs font-medium active:scale-95 transition-transform"
+          >
+            Today
+          </button>
+          <button
+            type="button"
+            onClick={() => setDate(toKey(addDays(new Date(), 7)))}
+            className="px-3 py-1.5 rounded-lg bg-[#1B2030] text-[#8B92A3] text-xs font-medium active:scale-95 transition-transform"
+          >
+            In 1 week
+          </button>
+          <button
+            type="button"
+            onClick={() => setDate(toKey(addDays(new Date(), 14)))}
+            className="px-3 py-1.5 rounded-lg bg-[#1B2030] text-[#8B92A3] text-xs font-medium active:scale-95 transition-transform"
+          >
+            In 2 weeks
+          </button>
+        </div>
       </Field>
       <Field label="Time">
         <input type="time" className={inputCls} value={time} onChange={(e) => setTime(e.target.value)} />
